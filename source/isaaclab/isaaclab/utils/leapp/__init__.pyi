@@ -24,12 +24,15 @@ __all__ = [
     "build_write_connection",
     "joint_names_resolver",
     "leapp_tensor_semantics",
+    "motion_generation",
     "patch_env_for_export",
     "resolve_leapp_element_names",
     "target_frame_pose_resolver",
     "target_frame_quat_resolver",
     "target_frame_xyz_resolver",
 ]
+
+from . import motion_generation as motion_generation
 
 from .export_annotator import ExportPatcher, patch_env_for_export
 from .leapp_semantics import (
