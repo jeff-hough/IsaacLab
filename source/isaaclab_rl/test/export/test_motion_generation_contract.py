@@ -148,6 +148,73 @@ def test_signal_helpers(factory: Callable[..., TensorSemantics], kind: str) -> N
     assert semantics.extra == {"motiongen_signal": "flange.vacuum"}
 
 
+def test_site_pose_from_xyzw() -> None:
+    """Lab-native xyzw poses are explicitly packed in MotionGen order."""
+    positions = torch.tensor([[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]])
+    orientations = torch.tensor([[[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.7, 0.8]]])
+
+    poses = mg_semantics.site_pose_from_xyzw(positions=positions, orientations=orientations)
+
+    torch.testing.assert_close(
+        poses,
+        torch.tensor([[[1.0, 2.0, 3.0, 0.4, 0.1, 0.2, 0.3], [4.0, 5.0, 6.0, 0.8, 0.5, 0.6, 0.7]]]),
+    )
+
+
+@pytest.mark.parametrize(
+    ("factory", "kind"),
+    [
+        (mg_semantics.estimated.site_poses, "motiongen/estimated/site_pose"),
+        (mg_semantics.setpoint.site_poses, "motiongen/setpoint/site_pose"),
+        (mg_semantics.desired.site_poses, "motiongen/desired/site_pose"),
+    ],
+)
+def test_site_pose_helpers(factory: Callable[..., TensorSemantics], kind: str) -> None:
+    """Site-pose helpers record site names and canonical component order."""
+    tensor = torch.zeros((1, 2, 7), dtype=torch.float32)
+
+    description = TensorDescription(
+        "site_poses", tensor, semantics=factory(tensor=tensor, names=["base", "tool"])
+    ).dict()
+
+    assert description["kind"] == kind
+    assert description["element_names"] == [
+        ["base", "tool"],
+        ["x", "y", "z", "qw", "qx", "qy", "qz"],
+    ]
+
+
+@pytest.mark.parametrize(
+    ("factory", "kind"),
+    [
+        (mg_semantics.estimated.site_twists, "motiongen/estimated/site_twist"),
+        (mg_semantics.setpoint.site_twists, "motiongen/setpoint/site_twist"),
+        (mg_semantics.desired.site_twists, "motiongen/desired/site_twist"),
+    ],
+)
+def test_site_twist_helpers(factory: Callable[..., TensorSemantics], kind: str) -> None:
+    """Site-twist helpers record component order and expression frame."""
+    tensor = torch.zeros((1, 1, 6), dtype=torch.float32)
+
+    description = TensorDescription(
+        "site_twists",
+        tensor,
+        semantics=factory(tensor=tensor, names=["base"], expressed_in="site"),
+    ).dict()
+
+    assert description["kind"] == kind
+    assert description["element_names"] == [["base"], ["vx", "vy", "vz", "wx", "wy", "wz"]]
+    assert description["motiongen_twist_frame"] == "site"
+
+
+def test_site_helpers_reject_invalid_arguments() -> None:
+    """Pose shapes and twist-frame values are validated explicitly."""
+    with pytest.raises(ValueError, match="matching leading dimensions"):
+        mg_semantics.site_pose_from_xyzw(positions=torch.zeros((1, 2, 3)), orientations=torch.zeros((1, 1, 4)))
+    with pytest.raises(ValueError, match="expressed_in"):
+        mg_semantics.estimated.site_twists(tensor=torch.zeros((1, 1, 6)), names=["base"], expressed_in="body")
+
+
 def test_helpers_require_keyword_arguments() -> None:
     """Public helper arguments are keyword-only."""
     tensor = torch.zeros((1, 2), dtype=torch.float32)
@@ -156,3 +223,5 @@ def test_helpers_require_keyword_arguments() -> None:
         mg_semantics.estimated.joint_positions(tensor, ["joint_a", "joint_b"])
     with pytest.raises(TypeError):
         mg_semantics.estimated.signal("terrain.height_scan", tensor)
+    with pytest.raises(TypeError):
+        mg_semantics.site_pose_from_xyzw(torch.zeros((1, 3)), torch.zeros((1, 4)))

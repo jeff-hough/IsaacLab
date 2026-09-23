@@ -7,11 +7,37 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 import torch
 from leapp import InputKindEnum, OutputKindEnum
 from leapp.utils.tensor_description import TensorSemantics
 
-__all__ = ["desired", "estimated", "setpoint"]
+__all__ = ["desired", "estimated", "setpoint", "site_pose_from_xyzw"]
+
+_POSE_COMPONENTS = ["x", "y", "z", "qw", "qx", "qy", "qz"]
+_TWIST_COMPONENTS = ["vx", "vy", "vz", "wx", "wy", "wz"]
+
+
+def site_pose_from_xyzw(*, positions: torch.Tensor, orientations: torch.Tensor) -> torch.Tensor:
+    """Pack positions and ``xyzw`` orientations into MotionGen ``xyz+wxyz`` site poses.
+
+    Args:
+        positions: Site positions [m], shape ``(..., 3)``.
+        orientations: Site orientations as ``(qx, qy, qz, qw)``, shape ``(..., 4)``.
+
+    Returns:
+        Site poses ordered as ``(x, y, z, qw, qx, qy, qz)``, shape ``(..., 7)``.
+    """
+    if positions.shape[-1:] != (3,):
+        raise ValueError(f"positions must have shape (..., 3), got {tuple(positions.shape)}.")
+    if orientations.shape[-1:] != (4,):
+        raise ValueError(f"orientations must have shape (..., 4), got {tuple(orientations.shape)}.")
+    if positions.shape[:-1] != orientations.shape[:-1]:
+        raise ValueError("positions and orientations must have matching leading dimensions.")
+
+    orientations_wxyz = torch.cat((orientations[..., 3:4], orientations[..., :3]), dim=-1)
+    return torch.cat((positions, orientations_wxyz), dim=-1)
 
 
 class _StateSemantics:
@@ -49,6 +75,33 @@ class _StateSemantics:
             ref=tensor,
             kind=f"motiongen/{self._role}/signal",
             extra={"motiongen_signal": name},
+        )
+
+    def site_poses(self, *, tensor: torch.Tensor, names: list[str]) -> TensorSemantics:
+        """Describe World-to-Site poses in MotionGen ``xyz+wxyz`` order."""
+        return TensorSemantics(
+            name=f"{self._role}_site_poses",
+            ref=tensor,
+            kind=f"motiongen/{self._role}/site_pose",
+            element_names=[names, _POSE_COMPONENTS],
+        )
+
+    def site_twists(
+        self,
+        *,
+        tensor: torch.Tensor,
+        names: list[str],
+        expressed_in: Literal["world", "site"],
+    ) -> TensorSemantics:
+        """Describe site twists ordered as linear then angular velocity."""
+        if expressed_in not in ("world", "site"):
+            raise ValueError(f"expressed_in must be 'world' or 'site', got {expressed_in!r}.")
+        return TensorSemantics(
+            name=f"{self._role}_site_twists",
+            ref=tensor,
+            kind=f"motiongen/{self._role}/site_twist",
+            element_names=[names, _TWIST_COMPONENTS],
+            extra={"motiongen_twist_frame": expressed_in},
         )
 
     def _joint(
