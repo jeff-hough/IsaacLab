@@ -5,6 +5,8 @@
 
 """Tests for the versioned LEAPP/MotionGen interchange contract."""
 
+from collections.abc import Callable
+
 import pytest
 import torch
 
@@ -12,6 +14,8 @@ pytest.importorskip("leapp")
 
 from leapp import GraphConfigs, InputKindEnum, OutputKindEnum
 from leapp.utils.tensor_description import TensorDescription, TensorSemantics
+
+from isaaclab.utils.leapp import motion_generation as mg_semantics
 
 
 def test_standard_joint_semantic_kinds() -> None:
@@ -94,3 +98,61 @@ def test_motiongen_interface_version_serializes() -> None:
     configs = GraphConfigs(extra={"motiongen_interface_version": 1})
 
     assert configs.to_dict() == {"motiongen_interface_version": 1}
+
+
+@pytest.mark.parametrize(
+    ("factory", "kind", "name"),
+    [
+        (mg_semantics.estimated.joint_positions, InputKindEnum.JOINT_POSITION, "estimated_joint_positions"),
+        (mg_semantics.estimated.joint_velocities, InputKindEnum.JOINT_VELOCITY, "estimated_joint_velocities"),
+        (mg_semantics.estimated.joint_efforts, InputKindEnum.JOINT_EFFORT, "estimated_joint_efforts"),
+        (mg_semantics.setpoint.joint_positions, InputKindEnum.COMMAND_JOINT_POSITION, "setpoint_joint_positions"),
+        (mg_semantics.setpoint.joint_velocities, InputKindEnum.COMMAND_JOINT_VELOCITY, "setpoint_joint_velocities"),
+        (mg_semantics.setpoint.joint_efforts, InputKindEnum.COMMAND_JOINT_TORQUES, "setpoint_joint_efforts"),
+        (mg_semantics.desired.joint_positions, OutputKindEnum.JOINT_POSITION, "desired_joint_positions"),
+        (mg_semantics.desired.joint_velocities, OutputKindEnum.JOINT_VELOCITY, "desired_joint_velocities"),
+        (mg_semantics.desired.joint_efforts, OutputKindEnum.JOINT_EFFORT, "desired_joint_efforts"),
+    ],
+)
+def test_joint_helpers(
+    factory: Callable[..., TensorSemantics], kind: InputKindEnum | OutputKindEnum, name: str
+) -> None:
+    """Joint helpers select the role-specific kind, name, and ordering."""
+    tensor = torch.zeros((1, 2), dtype=torch.float32)
+
+    semantics = factory(tensor=tensor, names=["joint_b", "joint_a"])
+
+    assert semantics.name == name
+    assert semantics.ref is tensor
+    assert semantics.kind is kind
+    assert semantics.element_names == [["joint_b", "joint_a"]]
+
+
+@pytest.mark.parametrize(
+    ("factory", "kind"),
+    [
+        (mg_semantics.estimated.signal, "motiongen/estimated/signal"),
+        (mg_semantics.setpoint.signal, "motiongen/setpoint/signal"),
+        (mg_semantics.desired.signal, "motiongen/desired/signal"),
+    ],
+)
+def test_signal_helpers(factory: Callable[..., TensorSemantics], kind: str) -> None:
+    """Signal helpers attach the role and canonical SignalKey name."""
+    tensor = torch.zeros((1,), dtype=torch.bool)
+
+    semantics = factory(name="flange.vacuum", tensor=tensor)
+
+    assert semantics.name == "flange.vacuum"
+    assert semantics.ref is tensor
+    assert semantics.kind == kind
+    assert semantics.extra == {"motiongen_signal": "flange.vacuum"}
+
+
+def test_helpers_require_keyword_arguments() -> None:
+    """Public helper arguments are keyword-only."""
+    tensor = torch.zeros((1, 2), dtype=torch.float32)
+
+    with pytest.raises(TypeError):
+        mg_semantics.estimated.joint_positions(tensor, ["joint_a", "joint_b"])
+    with pytest.raises(TypeError):
+        mg_semantics.estimated.signal("terrain.height_scan", tensor)
