@@ -5,12 +5,17 @@
 
 """Tests for the versioned LEAPP/MotionGen interchange contract."""
 
+import importlib
+import importlib.util
+import sys
+import types
 from collections.abc import Callable
+from pathlib import Path
 
 import pytest
 import torch
 
-pytest.importorskip("leapp")
+leapp = pytest.importorskip("leapp")
 
 from leapp import GraphConfigs, InputKindEnum, OutputKindEnum
 from leapp.utils.tensor_description import TensorDescription, TensorSemantics
@@ -285,3 +290,184 @@ def test_helpers_require_keyword_arguments() -> None:
         mg_semantics.estimated.signal("terrain.height_scan", tensor)
     with pytest.raises(TypeError):
         mg_semantics.site_pose_from_xyzw(torch.zeros((1, 3)), torch.zeros((1, 4)))
+
+
+def _load_source_module(name: str, path: Path) -> types.ModuleType:
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_wip_motiongen_deploy() -> tuple[types.ModuleType, types.ModuleType]:
+    try:
+        motion_generation = importlib.import_module("isaacsim.robot_motion.experimental.motion_generation")
+        leapp_deploy = importlib.import_module("isaacsim.robot_motion.leapp_deploy")
+        return motion_generation, leapp_deploy
+    except ModuleNotFoundError:
+        pass
+
+    isaac_sim_root = Path(__file__).resolve().parents[5] / "omni_isaac_sim"
+    if not isaac_sim_root.is_dir():
+        pytest.skip(f"WIP Isaac Sim checkout not found at {isaac_sim_root}")
+
+    package_names = [
+        "isaacsim",
+        "isaacsim.robot_motion",
+        "isaacsim.robot_motion.experimental",
+        "isaacsim.robot_motion.experimental.motion_generation",
+        "isaacsim.robot_motion.experimental.motion_generation.impl",
+        "isaacsim.robot_motion.leapp_deploy",
+        "isaacsim.robot_motion.leapp_deploy.impl",
+    ]
+    for name in package_names:
+        module = types.ModuleType(name)
+        module.__path__ = []
+        sys.modules[name] = module
+
+    motiongen_root = isaac_sim_root / "source/libraries/isaacsim/robot_motion/experimental/motion_generation"
+    motiongen_impl = motiongen_root / "python/impl"
+    _load_source_module(
+        "isaacsim.robot_motion.experimental.motion_generation.impl._logging",
+        motiongen_impl / "_logging.py",
+    )
+    types_module = _load_source_module(
+        "isaacsim.robot_motion.experimental.motion_generation.impl.types",
+        motiongen_impl / "types.py",
+    )
+    base_controller = _load_source_module(
+        "isaacsim.robot_motion.experimental.motion_generation.impl.base_controller",
+        motiongen_impl / "base_controller.py",
+    )
+    robot_spec_check = _load_source_module(
+        "isaacsim.robot_motion.experimental.motion_generation.impl.robot_spec_check",
+        motiongen_impl / "robot_spec_check.py",
+    )
+    motion_generation = sys.modules["isaacsim.robot_motion.experimental.motion_generation"]
+    for symbol in ("JointState", "RobotSpec", "RobotState", "SignalKey", "SpatialState", "TwistFrame"):
+        setattr(motion_generation, symbol, getattr(types_module, symbol))
+    motion_generation.BaseController = base_controller.BaseController
+    motion_generation.check_robot_spec = robot_spec_check.check_robot_spec
+
+    deploy_impl = isaac_sim_root / "source/libraries/isaacsim/robot_motion/leapp_deploy/python/impl"
+    _load_source_module("isaacsim.robot_motion.leapp_deploy.impl._logging", deploy_impl / "_logging.py")
+    _load_source_module("isaacsim.robot_motion.leapp_deploy.impl.leapp_binding", deploy_impl / "leapp_binding.py")
+    controller_module = _load_source_module(
+        "isaacsim.robot_motion.leapp_deploy.impl.leapp_controller",
+        deploy_impl / "leapp_controller.py",
+    )
+    leapp_deploy = sys.modules["isaacsim.robot_motion.leapp_deploy"]
+    leapp_deploy.LeappController = controller_module.LeappController
+    return motion_generation, leapp_deploy
+
+
+def _export_motiongen_pipeline(root: Path) -> Path:
+    policy_name = "motiongen_contract"
+    joint_positions = torch.tensor([[1.0, 2.0]], dtype=torch.float32)
+    site_poses = torch.tensor([[[1.0, 2.0, 3.0, 1.0, 0.0, 0.0, 0.0]]], dtype=torch.float32)
+    force = torch.tensor([2.0], dtype=torch.float32)
+
+    leapp.start(policy_name, save_path=str(root), global_patching=False)
+    try:
+        joint_positions = leapp.annotate.input_tensors(
+            policy_name,
+            mg_semantics.estimated.joint_positions(tensor=joint_positions, names=["j0", "j1"]),
+        )
+        site_poses = leapp.annotate.input_tensors(
+            policy_name,
+            mg_semantics.estimated.site_poses(tensor=site_poses, names=["tool"]),
+        )
+        force = leapp.annotate.input_tensors(
+            policy_name,
+            mg_semantics.estimated.signal(name="force", tensor=force),
+        )
+        joint_targets = joint_positions + force.unsqueeze(1)
+        site_targets = site_poses + 0.0
+        vacuum = force > 0.0
+        leapp.annotate.output_tensors(
+            policy_name,
+            [
+                mg_semantics.desired.joint_positions(tensor=joint_targets, names=["j0", "j1"]),
+                mg_semantics.desired.site_poses(tensor=site_targets, names=["tool"]),
+                mg_semantics.desired.signal(name="vacuum", tensor=vacuum),
+            ],
+            export_with="jit-trace",
+        )
+    finally:
+        leapp.stop()
+    leapp.compile_graph(
+        visualize=False,
+        validate=False,
+        graph_configs=GraphConfigs(extra={"motiongen_interface_version": 1}),
+    )
+    return root / policy_name / f"{policy_name}.yaml"
+
+
+@pytest.mark.isaacsim_ci
+def test_exported_helpers_match_motiongen_controller(tmp_path: Path) -> None:
+    """Match raw LEAPP outputs after exporting through the Isaac Lab helpers."""
+    motion_generation, leapp_deploy = _load_wip_motiongen_deploy()
+    wp = importlib.import_module("warp")
+
+    policy_path = _export_motiongen_pipeline(tmp_path)
+    raw_runtime = leapp.InferenceManager(str(policy_path))
+    controller = leapp_deploy.LeappController.from_export(
+        policy_path,
+        robot_spec=motion_generation.RobotSpec(
+            joint_space=["j0", "j1"],
+            site_space=["tool"],
+            signals=[
+                motion_generation.SignalKey("force", wp.float32),
+                motion_generation.SignalKey("vacuum", wp.bool),
+            ],
+        ),
+    )
+    robot_spec = controller.robot_spec
+    estimated = motion_generation.RobotState(
+        robot_spec=robot_spec,
+        joints=motion_generation.JointState.from_name(
+            robot_joint_space=robot_spec.joint_space,
+            positions=(["j0", "j1"], wp.array([1.0, 2.0], dtype=wp.float32, device="cpu")),
+        ),
+        sites=motion_generation.SpatialState.from_name(
+            spatial_space=robot_spec.site_space,
+            positions=(["tool"], wp.array([[1.0, 2.0, 3.0]], dtype=wp.float32, device="cpu")),
+            orientations=(["tool"], wp.array([[1.0, 0.0, 0.0, 0.0]], dtype=wp.float32, device="cpu")),
+        ),
+        signals={robot_spec.signals["force"]: wp.array([2.0], dtype=wp.float32, device="cpu")},
+    )
+
+    raw_runtime.set_input_value(
+        node_name="motiongen_contract", input_name="estimated_joint_positions", value=torch.tensor([[1.0, 2.0]])
+    )
+    raw_runtime.set_input_value(
+        node_name="motiongen_contract",
+        input_name="estimated_site_poses",
+        value=torch.tensor([[[1.0, 2.0, 3.0, 1.0, 0.0, 0.0, 0.0]]]),
+    )
+    raw_runtime.set_input_value(node_name="motiongen_contract", input_name="force", value=torch.tensor([2.0]))
+    raw_outputs = raw_runtime({})
+    desired = controller.forward(estimated, None, t=0.0)
+
+    assert desired is not None
+    controller_joints = torch.from_numpy(desired.joints.positions.numpy()).unsqueeze(0)
+    controller_pose = torch.cat(
+        (
+            torch.from_numpy(desired.sites.positions.numpy()),
+            torch.from_numpy(desired.sites.orientations.numpy()),
+        ),
+        dim=-1,
+    ).unsqueeze(0)
+    controller_vacuum = torch.from_numpy(desired.get(robot_spec.signals["vacuum"]).numpy())
+    torch.testing.assert_close(
+        controller_joints, raw_outputs["motiongen_contract/desired_joint_positions"].cpu(), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        controller_pose, raw_outputs["motiongen_contract/desired_site_poses"].cpu(), rtol=0, atol=0
+    )
+    torch.testing.assert_close(controller_vacuum, raw_outputs["motiongen_contract/vacuum"].cpu(), rtol=0, atol=0)
+    assert controller_joints.tolist() == [[3.0, 4.0]]
+    assert controller_pose.tolist() == [[[1.0, 2.0, 3.0, 1.0, 0.0, 0.0, 0.0]]]
+    assert controller_vacuum.tolist() == [True]
