@@ -17,6 +17,30 @@ __all__ = ["desired", "estimated", "setpoint", "site_pose_from_xyzw"]
 
 _POSE_COMPONENTS = ["x", "y", "z", "qw", "qx", "qy", "qz"]
 _TWIST_COMPONENTS = ["vx", "vy", "vz", "wx", "wy", "wz"]
+_SIGNAL_DTYPES = {
+    torch.bool,
+    torch.int8,
+    torch.int16,
+    torch.int32,
+    torch.int64,
+    torch.float16,
+    torch.float32,
+    torch.float64,
+}
+
+
+def _validate_names(*, names: list[str], label: str) -> None:
+    if not names or not all(isinstance(name, str) and name for name in names):
+        raise ValueError(f"{label} names must be non-empty strings.")
+    if len(set(names)) != len(names):
+        raise ValueError(f"{label} names must be unique.")
+
+
+def _validate_float_tensor(*, tensor: torch.Tensor, shape: tuple[int, ...], label: str) -> None:
+    if tensor.dtype is not torch.float32:
+        raise ValueError(f"{label} tensor must have dtype float32, got {tensor.dtype}.")
+    if tuple(tensor.shape) != shape:
+        raise ValueError(f"{label} tensor must have shape {shape}, got {tuple(tensor.shape)}.")
 
 
 def site_pose_from_xyzw(*, positions: torch.Tensor, orientations: torch.Tensor) -> torch.Tensor:
@@ -70,6 +94,12 @@ class _StateSemantics:
 
     def signal(self, *, name: str, tensor: torch.Tensor) -> TensorSemantics:
         """Describe a tensor backed by a MotionGen ``SignalKey``."""
+        if not isinstance(name, str) or not name:
+            raise ValueError("Signal name must be a non-empty string.")
+        if tensor.ndim < 1 or tensor.shape[0] != 1:
+            raise ValueError(f"Signal tensor must have leading batch size 1, got shape {tuple(tensor.shape)}.")
+        if tensor.dtype not in _SIGNAL_DTYPES:
+            raise ValueError(f"Signal tensor has unsupported scalar dtype {tensor.dtype}.")
         return TensorSemantics(
             name=name,
             ref=tensor,
@@ -79,6 +109,8 @@ class _StateSemantics:
 
     def site_poses(self, *, tensor: torch.Tensor, names: list[str]) -> TensorSemantics:
         """Describe World-to-Site poses in MotionGen ``xyz+wxyz`` order."""
+        _validate_names(names=names, label="Site")
+        _validate_float_tensor(tensor=tensor, shape=(1, len(names), 7), label="Site pose")
         return TensorSemantics(
             name=f"{self._role}_site_poses",
             ref=tensor,
@@ -94,6 +126,8 @@ class _StateSemantics:
         expressed_in: Literal["world", "site"],
     ) -> TensorSemantics:
         """Describe site twists ordered as linear then angular velocity."""
+        _validate_names(names=names, label="Site")
+        _validate_float_tensor(tensor=tensor, shape=(1, len(names), 6), label="Site twist")
         if expressed_in not in ("world", "site"):
             raise ValueError(f"expressed_in must be 'world' or 'site', got {expressed_in!r}.")
         return TensorSemantics(
@@ -112,6 +146,8 @@ class _StateSemantics:
         field: str,
         kind: InputKindEnum | OutputKindEnum,
     ) -> TensorSemantics:
+        _validate_names(names=names, label="Joint")
+        _validate_float_tensor(tensor=tensor, shape=(1, len(names)), label="Joint")
         return TensorSemantics(
             name=f"{self._role}_joint_{field}",
             ref=tensor,

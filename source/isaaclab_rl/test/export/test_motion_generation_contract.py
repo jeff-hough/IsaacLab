@@ -73,7 +73,8 @@ def test_signal_scalar_dtypes_serialize(torch_dtype: torch.dtype, leapp_dtype: s
     """Supported scalar dtypes retain their canonical LEAPP spelling."""
     tensor = torch.zeros((1, 3), dtype=torch_dtype)
 
-    description = TensorDescription("signal", tensor).dict()
+    semantics = mg_semantics.estimated.signal(name="signal", tensor=tensor)
+    description = TensorDescription("signal", tensor, semantics=semantics).dict()
 
     assert description["dtype"] == leapp_dtype
 
@@ -205,6 +206,65 @@ def test_site_twist_helpers(factory: Callable[..., TensorSemantics], kind: str) 
     assert description["kind"] == kind
     assert description["element_names"] == [["base"], ["vx", "vy", "vz", "wx", "wy", "wz"]]
     assert description["motiongen_twist_frame"] == "site"
+
+
+@pytest.mark.parametrize(
+    ("tensor", "names", "match"),
+    [
+        (torch.zeros((2, 2), dtype=torch.float32), ["joint_a", "joint_b"], "shape"),
+        (torch.zeros((1, 3), dtype=torch.float32), ["joint_a", "joint_b"], "shape"),
+        (torch.zeros((1, 2), dtype=torch.float64), ["joint_a", "joint_b"], "dtype"),
+        (torch.zeros((1, 2), dtype=torch.float32), ["joint_a", "joint_a"], "unique"),
+        (torch.zeros((1, 0), dtype=torch.float32), [], "non-empty"),
+    ],
+)
+def test_joint_helpers_reject_invalid_contract(tensor: torch.Tensor, names: list[str], match: str) -> None:
+    """Joint helpers reject invalid batch, joint-axis, dtype, and names."""
+    with pytest.raises(ValueError, match=match):
+        mg_semantics.estimated.joint_positions(tensor=tensor, names=names)
+
+
+@pytest.mark.parametrize(
+    ("factory", "tensor", "names", "kwargs"),
+    [
+        (mg_semantics.estimated.site_poses, torch.zeros((1, 2, 6)), ["base", "tool"], {}),
+        (mg_semantics.estimated.site_poses, torch.zeros((2, 2, 7)), ["base", "tool"], {}),
+        (mg_semantics.estimated.site_poses, torch.zeros((1, 1, 7)), ["base", "tool"], {}),
+        (mg_semantics.estimated.site_poses, torch.zeros((1, 2, 7), dtype=torch.float64), ["base", "tool"], {}),
+        (
+            mg_semantics.estimated.site_twists,
+            torch.zeros((1, 2, 7)),
+            ["base", "tool"],
+            {"expressed_in": "world"},
+        ),
+    ],
+)
+def test_site_helpers_reject_invalid_tensor_contract(
+    factory: Callable[..., TensorSemantics], tensor: torch.Tensor, names: list[str], kwargs: dict
+) -> None:
+    """Site helpers reject invalid batch, site-axis, component-axis, and dtype layouts."""
+    with pytest.raises(ValueError):
+        factory(tensor=tensor, names=names, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "tensor",
+    [
+        torch.zeros((), dtype=torch.float32),
+        torch.zeros((2, 3), dtype=torch.float32),
+        torch.zeros((1, 3), dtype=torch.complex64),
+    ],
+)
+def test_signal_helpers_reject_invalid_tensor_contract(tensor: torch.Tensor) -> None:
+    """Signal helpers require one batch entry and a supported scalar dtype."""
+    with pytest.raises(ValueError):
+        mg_semantics.estimated.signal(name="signal", tensor=tensor)
+
+
+def test_signal_helpers_reject_empty_name() -> None:
+    """Signal helpers require a canonical non-empty signal name."""
+    with pytest.raises(ValueError, match="non-empty"):
+        mg_semantics.estimated.signal(name="", tensor=torch.zeros((1,), dtype=torch.bool))
 
 
 def test_site_helpers_reject_invalid_arguments() -> None:
